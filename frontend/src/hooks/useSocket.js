@@ -7,7 +7,8 @@ export const useSocket = (token) => {
 
   useEffect(() => {
     if (!token) return;
-    socketRef.current = io('http://localhost:5000', { auth: { token } });
+    const API = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+    socketRef.current = io(API, { auth: { token } });
     socketRef.current.on('connect',    () => setConnected(true));
     socketRef.current.on('disconnect', () => setConnected(false));
     return () => { socketRef.current?.disconnect(); };
