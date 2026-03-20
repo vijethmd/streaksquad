@@ -1,0 +1,129 @@
+const express = require('express');
+const router  = express.Router();
+const Checkin = require('../models/Checkin');
+const Squad   = require('../models/Squad');
+const User    = require('../models/User');
+const auth    = require('../middleware/auth');
+
+// POST /api/streaks/checkin
+router.post('/checkin', auth, async (req, res) => {
+  try {
+    const { squadId, note, mood, completed, amountLogged } = req.body;
+    if (!squadId) return res.status(400).json({ error: 'squadId required' });
+
+    const today = new Date().toISOString().slice(0, 10);
+    const existing = await Checkin.findOne({ user: req.user._id, squad: squadId, dateKey: today });
+    if (existing) return res.status(400).json({ error: 'Already checked in today' });
+
+    const squad = await Squad.findById(squadId);
+    if (!squad) return res.status(404).json({ error: 'Squad not found' });
+
+    const memberIdx = squad.members.findIndex(m => m.user.toString() === req.user._id.toString());
+    if (memberIdx === -1) return res.status(403).json({ error: 'Not a member of this squad' });
+
+    // For boolean squads, only count as a valid streak day if completed = true
+    // For amount squads, only count if amountLogged >= goalTarget (if set)
+    const isCountable = squad.goalType === 'amount'
+      ? (squad.goalTarget ? (amountLogged || 0) >= squad.goalTarget : true)
+      : (completed !== false);
+
+    const member = squad.members[memberIdx];
+    const now    = new Date();
+    let newStreak = member.currentStreak;
+
+    if (isCountable) {
+      if (member.lastCheckin) {
+        const diffHours = (now - new Date(member.lastCheckin)) / (1000 * 60 * 60);
+        newStreak = diffHours <= 48 ? member.currentStreak + 1 : 1;
+      } else {
+        newStreak = 1;
+      }
+    }
+    // If not countable (e.g. logged 0 pages) streak stays but doesn't grow
+
+    squad.members[memberIdx].currentStreak = newStreak;
+    squad.members[memberIdx].longestStreak = Math.max(member.longestStreak, newStreak);
+    squad.members[memberIdx].totalCheckins += 1;
+    squad.members[memberIdx].lastCheckin   = now;
+    await squad.save();
+
+    await User.findByIdAndUpdate(req.user._id, {
+      $inc: { totalStreakDays: isCountable ? 1 : 0 },
+      $max: { longestStreak: newStreak }
+    });
+
+    const checkin = await Checkin.create({
+      user: req.user._id, squad: squadId,
+      note: note || '', mood: mood || 3,
+      completed: completed !== false,
+      amountLogged: squad.goalType === 'amount' ? (amountLogged || 0) : null,
+      streakDay: newStreak, date: now
+    });
+
+    const populated = await checkin.populate('user', 'username avatar');
+
+    const badges = [];
+    if (newStreak === 7)   badges.push({ id: 'week1',  name: '1 Week Strong', icon: 'fire' });
+    if (newStreak === 30)  badges.push({ id: 'month1', name: 'Month Master',  icon: 'diamond' });
+    if (newStreak === 100) badges.push({ id: 'cent',   name: 'Centurion',     icon: 'lightning' });
+    if (badges.length) {
+      await User.findByIdAndUpdate(req.user._id, { $push: { badges: { $each: badges } } });
+    }
+
+    req.io.to(`squad_${squadId}`).emit('new_checkin', { checkin: populated, memberStreak: newStreak, badges });
+    res.status(201).json({ checkin: populated, currentStreak: newStreak, badges });
+  } catch (err) {
+    if (err.code === 11000) return res.status(400).json({ error: 'Already checked in today' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/streaks/squad/:squadId
+router.get('/squad/:squadId', auth, async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+    const checkins = await Checkin.find({ squad: req.params.squadId })
+      .populate('user', 'username avatar')
+      .sort({ date: -1 })
+      .skip((page - 1) * limit)
+      .limit(parseInt(limit));
+    res.json(checkins);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/streaks/heatmap/:squadId/:userId
+router.get('/heatmap/:squadId/:userId', auth, async (req, res) => {
+  try {
+    const checkins = await Checkin.find({ squad: req.params.squadId, user: req.params.userId })
+      .select('dateKey mood streakDay completed amountLogged')
+      .sort({ date: 1 });
+    const heatmap = {};
+    checkins.forEach(c => {
+      heatmap[c.dateKey] = { mood: c.mood, streakDay: c.streakDay, completed: c.completed, amountLogged: c.amountLogged };
+    });
+    res.json(heatmap);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/streaks/:checkinId/react
+router.post('/:checkinId/react', auth, async (req, res) => {
+  try {
+    const { reaction } = req.body;
+    const checkin = await Checkin.findById(req.params.checkinId);
+    if (!checkin) return res.status(404).json({ error: 'Checkin not found' });
+    const existingIdx = checkin.reactions.findIndex(r => r.user.toString() === req.user._id.toString());
+    if (existingIdx > -1) checkin.reactions[existingIdx].reaction = reaction;
+    else checkin.reactions.push({ user: req.user._id, reaction });
+    await checkin.save();
+    req.io.to(`squad_${checkin.squad}`).emit('reaction_added', { checkinId: checkin._id, userId: req.user._id, reaction });
+    res.json(checkin);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
